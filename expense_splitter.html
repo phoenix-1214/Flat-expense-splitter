@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flat Expense Splitter</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.5rem; }
+  label { font-weight: 600; display: block; margin-top: 1rem; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; }
+  textarea { height: 180px; font-family: monospace; }
+  button { margin-top: 1rem; padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  .errors { background: #fdecea; color: #8a1c1c; padding: .75rem 1rem; border-radius: 6px; margin-top: 1rem; }
+  .errors li { margin: .2rem 0; }
+  .transfers { background: #eef7ee; padding: .75rem 1rem; border-radius: 6px; margin-top: 1rem; }
+  .transfers li { margin: .3rem 0; }
+  .pos { color: #1a7f37; }
+  .neg { color: #b42318; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+<h1>Flat Expense Splitter</h1>
+
+<label for="people">Flatmates (3 to 5 names, comma-separated)</label>
+<input id="people" value="Asha, Ravi, Meera, Kabir">
+
+<label for="expenses">Expenses, one per line: Item, amount, paid by, split between</label>
+<small>Use "all" to split between everyone, or list names separated by commas. Item names cannot contain commas.</small>
+<textarea id="expenses">Dinner, 1200, Asha, all
+Groceries, 850.50, Ravi, Asha, Ravi, Meera
+Electricity, 1400, Meera, all
+Wifi, 999, Kabir, Asha, Ravi, Meera, Kabir
+Cab, 320, Asha, Asha, Kabir</textarea>
+
+<button id="calc">Split expenses</button>
+<div id="output"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = p => (p < 0 ? '-' : '') + '₹' + (Math.abs(p) / 100).toFixed(2);
+
+$('calc').onclick = run;
+
+function run() {
+  const errors = [];
+
+  // Roster
+  const roster = $('people').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (roster.length < 3 || roster.length > 5) errors.push('Roster: enter between 3 and 5 names.');
+  const lookup = new Map(roster.map(n => [n.toLowerCase(), n]));
+  if (lookup.size !== roster.length) errors.push('Roster: names must be unique.');
+  const resolve = name => lookup.get(name.toLowerCase());
+
+  // Parse expenses (amounts stored as integer paise to avoid float errors)
+  const items = [];
+  $('expenses').value.split('\n').forEach((raw, i) => {
+    const lineNo = i + 1;
+    if (!raw.trim()) return;
+    const fail = msg => errors.push(`Line ${lineNo}: ${msg}`);
+    const f = raw.split(',').map(s => s.trim());
+
+    if (f.length < 4) return fail('expected "Item, amount, paid by, split between".');
+    const [item, amtStr, payerStr] = f;
+    const rest = f.slice(3);
+
+    if (!item) return fail('item name is empty.');
+    if (!/^\d+(\.\d{1,2})?$/.test(amtStr) || Number(amtStr) <= 0)
+      return fail(`amount "${amtStr}" must be a positive number with up to 2 decimals.`);
+
+    const payer = resolve(payerStr);
+    if (!payer) return fail(`unknown payer "${payerStr}".`);
+
+    let split;
+    if (rest.length === 1 && rest[0].toLowerCase() === 'all') {
+      split = [...roster];
+    } else {
+      if (rest.some(n => n.toLowerCase() === 'all'))
+        return fail('"all" cannot be combined with other names.');
+      if (rest.some(n => !n)) return fail('split between has an empty name.');
+      const bad = rest.filter(n => !resolve(n));
+      if (bad.length) return fail(`unknown name(s) in split: ${bad.join(', ')}.`);
+      const chosen = new Set(rest.map(resolve));
+      split = roster.filter(n => chosen.has(n)); // keep roster order
+    }
+
+    items.push({ paise: Math.round(Number(amtStr) * 100), payer, split });
+  });
+
+  const out = $('output');
+  if (errors.length) {
+    out.innerHTML = '<div class="errors"><strong>Fix these lines to see the split:</strong><ul>' +
+      errors.map(e => `<li>${esc(e)}</li>`).join('') + '</ul></div>';
+    return;
+  }
+  if (items.length === 0) {
+    out.innerHTML = '<div class="errors">No expenses entered.</div>';
+    return;
+  }
+
+  // Calculate paid and owed
+  const paid = {}, owed = {};
+  roster.forEach(n => { paid[n] = 0; owed[n] = 0; });
+  items.forEach(it => {
+    paid[it.payer] += it.paise;
+    const base = Math.floor(it.paise / it.split.length);
+    const rem = it.paise - base * it.split.length; // spread leftover paise over first people
+    it.split.forEach((n, k) => { owed[n] += base + (k < rem ? 1 : 0); });
+  });
+  const net = {};
+  roster.forEach(n => { net[n] = paid[n] - owed[n]; });
+
+  // Minimum-ish transfers: greedy largest creditor vs largest debtor (at most n-1 payments)
+  const creditors = roster.filter(n => net[n] > 0).map(n => ({ n, a: net[n] })).sort((x, y) => y.a - x.a);
+  const debtors = roster.filter(n => net[n] < 0).map(n => ({ n, a: -net[n] })).sort((x, y) => y.a - x.a);
+  const transfers = [];
+  let i = 0, j = 0;
+  while (i < creditors.length && j < debtors.length) {
+    const amt = Math.min(creditors[i].a, debtors[j].a);
+    transfers.push(`${esc(debtors[j].n)} pays ${esc(creditors[i].n)} ${fmt(amt)}.`);
+    creditors[i].a -= amt;
+    debtors[j].a -= amt;
+    if (creditors[i].a === 0) i++;
+    if (debtors[j].a === 0) j++;
+  }
+
+  // Render
+  const rows = roster.map(n => {
+    const cls = net[n] >= 0 ? 'pos' : 'neg';
+    return `<tr><td>${esc(n)}</td><td>${fmt(paid[n])}</td><td>${fmt(owed[n])}</td>` +
+           `<td class="${cls}">${fmt(net[n])}</td></tr>`;
+  }).join('');
+
+  out.innerHTML =
+    `<p><small>Parsed ${items.length} expense(s). Positive net means the person is owed money.</small></p>` +
+    '<table><thead><tr><th>Flatmate</th><th>Total paid</th><th>Total share</th><th>Net balance</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table>` +
+    '<div class="transfers"><strong>Settlements</strong>' +
+    (transfers.length
+      ? '<ul>' + transfers.map(t => `<li>${t}</li>`).join('') + '</ul>'
+      : '<p>Everyone is settled.</p>') +
+    '</div>';
+}
+
+run();
+</script>
+</body>
+</html>
